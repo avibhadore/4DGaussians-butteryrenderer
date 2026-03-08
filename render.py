@@ -171,6 +171,8 @@ def render_sets(dataset, hyperparam, iteration, pipeline, skip_train, skip_test,
         if not skip_video:
             video_cams = scene.getVideoCameras()
             if dense_video:
+                if total_frames is None:
+                    total_frames = len(video_cams) * FRAMES_PER_CAM
                 print(f"\n  Generating {total_frames} interpolated cameras from "
                       f"{len(video_cams)} training poses at {video_fps}fps "
                       f"= {total_frames/video_fps:.1f}s")
@@ -179,37 +181,32 @@ def render_sets(dataset, hyperparam, iteration, pipeline, skip_train, skip_test,
                        video_cams, gaussians, pipeline, background, cam_type, fps=video_fps)
 
 
+# ── Hardcoded rendering settings ─────────────────────────────────────────────
+VIDEO_FPS         = 30
+FRAMES_PER_CAM    = 9    # total_frames = num_training_cams * FRAMES_PER_CAM
+CONFIGS           = "arguments/hypernerf/default.py"
+# ─────────────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     parser = ArgumentParser(description="Testing script parameters")
     model      = ModelParams(parser, sentinel=True)
     pipeline   = PipelineParams(parser)
     hyperparam = ModelHiddenParams(parser)
 
-    parser.add_argument("--iteration",    default=-1, type=int)
-    parser.add_argument("--skip_train",   action="store_true")
-    parser.add_argument("--skip_test",    action="store_true")
-    parser.add_argument("--skip_video",   action="store_true")
-    parser.add_argument("--quiet",        action="store_true")
-    parser.add_argument("--configs",      type=str)
-
-    parser.add_argument("--dense_video",  action="store_true",
-                        help="Generate new cameras between training poses via spline interpolation")
-    parser.add_argument("--total_frames", type=int, default=300,
-                        help="Total frames to render (default: 300 = 10s @ 30fps)")
-    parser.add_argument("--video_fps",    type=int, default=30,
-                        help="Output video frame rate (default: 30)")
+    parser.add_argument("--iteration", default=-1, type=int)
+    parser.add_argument("--quiet",     action="store_true")
 
     args = get_combined_args(parser)
     print("Rendering", args.model_path)
 
-    if args.configs:
-        import importlib.util
-        from utils.params_utils import merge_hparams
-        spec = importlib.util.spec_from_file_location("config", args.configs)
-        config_module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(config_module)
-        config = {k: v for k, v in vars(config_module).items() if not k.startswith("_")}
-        args = merge_hparams(args, config)
+    # Load hardcoded config
+    import importlib.util
+    from utils.params_utils import merge_hparams
+    spec = importlib.util.spec_from_file_location("config", CONFIGS)
+    config_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config_module)
+    config = {k: v for k, v in vars(config_module).items() if not k.startswith("_")}
+    args = merge_hparams(args, config)
 
     safe_state(args.quiet)
 
@@ -218,10 +215,10 @@ if __name__ == "__main__":
         hyperparam.extract(args),
         args.iteration,
         pipeline.extract(args),
-        args.skip_train,
-        args.skip_test,
-        args.skip_video,
-        dense_video=args.dense_video,
-        total_frames=args.total_frames,
-        video_fps=args.video_fps,
+        skip_train=True,
+        skip_test=True,
+        skip_video=False,
+        dense_video=True,
+        total_frames=None,   # computed dynamically from num cameras * FRAMES_PER_CAM
+        video_fps=VIDEO_FPS,
     )
