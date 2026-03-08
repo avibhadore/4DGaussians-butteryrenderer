@@ -3,17 +3,22 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and educational use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
+# ── Modifications ────────────────────────────────────────────────────────────
+# - mmcv replaced with importlib
+# - Added --dense_video: renders new interpolated cameras between training poses
+#   using cubic spline (translation) + RotationSpline (rotation) on SO(3).
+#   Produces total_frames new cameras at 30fps for smooth video.
+# ─────────────────────────────────────────────────────────────────────────────
 import imageio
 import numpy as np
 import torch
 from scene import Scene
 import os
-import cv2
 from tqdm import tqdm
 from os import makedirs
 from gaussian_renderer import render
@@ -22,9 +27,14 @@ from utils.general_utils import safe_state
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args, ModelHiddenParams
 from gaussian_renderer import GaussianModel
+from scene.cameras import MiniCam
+from utils.graphics_utils import getWorld2View2, getProjectionMatrix
+from scipy.interpolate import CubicSpline
+from scipy.spatial.transform import Rotation, RotationSpline
 from time import time
-import threading
 import concurrent.futures
+
+
 def multithread_write(image_list, path):
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=None)
     def write_image(image, count, path):
@@ -33,7 +43,6 @@ def multithread_write(image_list, path):
             return count, True
         except:
             return count, False
-        
     tasks = []
     for index, image in enumerate(image_list):
         tasks.append(executor.submit(write_image, image, index, path))
@@ -41,75 +50,178 @@ def multithread_write(image_list, path):
     for index, status in enumerate(tasks):
         if status == False:
             write_image(image_list[index], index, path)
-    
-to8b = lambda x : (255*np.clip(x.cpu().numpy(),0,1)).astype(np.uint8)
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background, cam_type):
+
+to8b = lambda x: (255 * np.clip(x.cpu().numpy(), 0, 1)).astype(np.uint8)
+
+
+def build_interpolated_cameras(views, total_frames):
+    """
+    Generate total_frames new cameras by fitting smooth splines through
+    all training camera poses, then sampling densely.
+
+    - Translations: scipy CubicSpline
+    - Rotations: scipy RotationSpline (smooth on SO(3))
+    - Time: uniform 0 → 1
+
+    This creates genuinely new camera poses between the training cameras,
+    not just the training cameras repeated.
+    """
+    n = len(views)
+    t_knots = np.linspace(0.0, 1.0, n)
+
+    # Fit splines through all training poses
+    translations = np.stack([v.T for v in views])           # (n, 3)
+    rotations    = Rotation.from_matrix([v.R for v in views])
+    trans_spline = CubicSpline(t_knots, translations)
+    rot_spline   = RotationSpline(t_knots, rotations)
+
+    # Time values (for 4DGS deformation)
+    times = np.array([
+        v.time if hasattr(v, 'time') else float(i) / (n - 1)
+        for i, v in enumerate(views)
+    ])
+    time_spline = CubicSpline(t_knots, times)
+
+    # Sample densely
+    t_dense     = np.linspace(0.0, 1.0, total_frames)
+    T_dense     = trans_spline(t_dense)
+    R_dense     = rot_spline(t_dense).as_matrix()
+    times_dense = np.clip(time_spline(t_dense), 0.0, 1.0)
+
+    ref = views[0]
+    result = []
+    for i in range(total_frames):
+        world_view = torch.tensor(
+            getWorld2View2(R_dense[i], T_dense[i])
+        ).transpose(0, 1).cuda()
+
+        proj = getProjectionMatrix(
+            znear=ref.znear, zfar=ref.zfar,
+            fovX=ref.FoVx,  fovY=ref.FoVy
+        ).transpose(0, 1).cuda()
+
+        full_proj = (world_view.unsqueeze(0).bmm(proj.unsqueeze(0))).squeeze(0)
+
+        result.append(MiniCam(
+            width=ref.image_width,
+            height=ref.image_height,
+            fovy=ref.FoVy,
+            fovx=ref.FoVx,
+            znear=ref.znear,
+            zfar=ref.zfar,
+            world_view_transform=world_view,
+            full_proj_transform=full_proj,
+            time=float(times_dense[i]),
+        ))
+
+    return result
+
+
+def render_set(model_path, name, iteration, views, gaussians, pipeline, background, cam_type, fps=30):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
-    gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
+    gts_path    = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
 
     makedirs(render_path, exist_ok=True)
-    makedirs(gts_path, exist_ok=True)
+    makedirs(gts_path,    exist_ok=True)
+
     render_images = []
-    gt_list = []
-    render_list = []
-    print("point nums:",gaussians._xyz.shape[0])
+    gt_list       = []
+    render_list   = []
+
+    print("point nums:", gaussians._xyz.shape[0])
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        if idx == 0:time1 = time()
-        
-        rendering = render(view, gaussians, pipeline, background,cam_type=cam_type)["render"]
-        render_images.append(to8b(rendering).transpose(1,2,0))
+        if idx == 0: time1 = time()
+        rendering = render(view, gaussians, pipeline, background, cam_type=cam_type)["render"]
+        render_images.append(to8b(rendering).transpose(1, 2, 0))
         render_list.append(rendering)
         if name in ["train", "test"]:
             if cam_type != "PanopticSports":
                 gt = view.original_image[0:3, :, :]
             else:
-                gt  = view['image'].cuda()
+                gt = view['image'].cuda()
             gt_list.append(gt)
 
-    time2=time()
-    print("FPS:",(len(views)-1)/(time2-time1))
+    time2 = time()
+    print("FPS:", (len(views) - 1) / (time2 - time1))
 
-    multithread_write(gt_list, gts_path)
-
+    multithread_write(gt_list,     gts_path)
     multithread_write(render_list, render_path)
 
-    
-    imageio.mimwrite(os.path.join(model_path, name, "ours_{}".format(iteration), 'video_rgb.mp4'), render_images, fps=30)
-def render_sets(dataset : ModelParams, hyperparam, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, skip_video: bool):
+    out_path = os.path.join(model_path, name, "ours_{}".format(iteration), 'video_rgb.mp4')
+    imageio.mimwrite(out_path, render_images, fps=fps)
+    print(f"  Written: {out_path}  ({len(render_images)} frames @ {fps}fps = {len(render_images)/fps:.1f}s)")
+
+
+def render_sets(dataset, hyperparam, iteration, pipeline, skip_train, skip_test,
+                skip_video, dense_video, total_frames, video_fps):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree, hyperparam)
-        scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
-        cam_type=scene.dataset_type
-        bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
+        scene     = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
+        cam_type  = scene.dataset_type
+
+        bg_color   = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
         if not skip_train:
-            render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background,cam_type)
-
+            render_set(dataset.model_path, "train", scene.loaded_iter,
+                       scene.getTrainCameras(), gaussians, pipeline, background, cam_type, fps=video_fps)
         if not skip_test:
-            render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background,cam_type)
+            render_set(dataset.model_path, "test", scene.loaded_iter,
+                       scene.getTestCameras(), gaussians, pipeline, background, cam_type, fps=video_fps)
         if not skip_video:
-            render_set(dataset.model_path,"video",scene.loaded_iter,scene.getVideoCameras(),gaussians,pipeline,background,cam_type)
+            video_cams = scene.getVideoCameras()
+            if dense_video:
+                print(f"\n  Generating {total_frames} interpolated cameras from "
+                      f"{len(video_cams)} training poses at {video_fps}fps "
+                      f"= {total_frames/video_fps:.1f}s")
+                video_cams = build_interpolated_cameras(video_cams, total_frames)
+            render_set(dataset.model_path, "video", scene.loaded_iter,
+                       video_cams, gaussians, pipeline, background, cam_type, fps=video_fps)
+
+
 if __name__ == "__main__":
-    # Set up command line argument parser
     parser = ArgumentParser(description="Testing script parameters")
-    model = ModelParams(parser, sentinel=True)
-    pipeline = PipelineParams(parser)
+    model      = ModelParams(parser, sentinel=True)
+    pipeline   = PipelineParams(parser)
     hyperparam = ModelHiddenParams(parser)
-    parser.add_argument("--iteration", default=-1, type=int)
-    parser.add_argument("--skip_train", action="store_true")
-    parser.add_argument("--skip_test", action="store_true")
-    parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--skip_video", action="store_true")
-    parser.add_argument("--configs", type=str)
+
+    parser.add_argument("--iteration",    default=-1, type=int)
+    parser.add_argument("--skip_train",   action="store_true")
+    parser.add_argument("--skip_test",    action="store_true")
+    parser.add_argument("--skip_video",   action="store_true")
+    parser.add_argument("--quiet",        action="store_true")
+    parser.add_argument("--configs",      type=str)
+
+    parser.add_argument("--dense_video",  action="store_true",
+                        help="Generate new cameras between training poses via spline interpolation")
+    parser.add_argument("--total_frames", type=int, default=300,
+                        help="Total frames to render (default: 300 = 10s @ 30fps)")
+    parser.add_argument("--video_fps",    type=int, default=30,
+                        help="Output video frame rate (default: 30)")
+
     args = get_combined_args(parser)
-    print("Rendering " , args.model_path)
+    print("Rendering", args.model_path)
+
     if args.configs:
-        import mmcv
+        import importlib.util
         from utils.params_utils import merge_hparams
-        config = mmcv.Config.fromfile(args.configs)
+        spec = importlib.util.spec_from_file_location("config", args.configs)
+        config_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(config_module)
+        config = {k: v for k, v in vars(config_module).items() if not k.startswith("_")}
         args = merge_hparams(args, config)
-    # Initialize system state (RNG)
+
     safe_state(args.quiet)
 
-    render_sets(model.extract(args), hyperparam.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, args.skip_video)
+    render_sets(
+        model.extract(args),
+        hyperparam.extract(args),
+        args.iteration,
+        pipeline.extract(args),
+        args.skip_train,
+        args.skip_test,
+        args.skip_video,
+        dense_video=args.dense_video,
+        total_frames=args.total_frames,
+        video_fps=args.video_fps,
+    )
