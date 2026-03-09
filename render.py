@@ -183,7 +183,7 @@ def render_sets(dataset, hyperparam, iteration, pipeline, skip_train, skip_test,
 
 # ── Hardcoded rendering settings ─────────────────────────────────────────────
 VIDEO_FPS         = 30
-FRAMES_PER_CAM    = 9    # total_frames = num_training_cams * FRAMES_PER_CAM
+FRAMES_PER_CAM    = 15   # 30fps output / 2fps input = 15 frames per training camera
 CONFIGS           = "arguments/hypernerf/default.py"
 # ─────────────────────────────────────────────────────────────────────────────
 
