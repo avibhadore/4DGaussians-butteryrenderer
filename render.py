@@ -153,7 +153,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
 
 def render_sets(dataset, hyperparam, iteration, pipeline, skip_train, skip_test,
-                skip_video, dense_video, total_frames, video_fps):
+                skip_video, dense_video, total_frames, video_fps, samplerate):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree, hyperparam)
         scene     = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
@@ -172,7 +172,7 @@ def render_sets(dataset, hyperparam, iteration, pipeline, skip_train, skip_test,
             video_cams = scene.getVideoCameras()
             if dense_video:
                 if total_frames is None:
-                    total_frames = len(video_cams) * FRAMES_PER_CAM
+                    total_frames = len(video_cams) * (30//samplerate)
                 print(f"\n  Generating {total_frames} interpolated cameras from "
                       f"{len(video_cams)} training poses at {video_fps}fps "
                       f"= {total_frames/video_fps:.1f}s")
@@ -184,6 +184,7 @@ def render_sets(dataset, hyperparam, iteration, pipeline, skip_train, skip_test,
 # ── Hardcoded rendering settings ─────────────────────────────────────────────
 VIDEO_FPS         = 30
 FRAMES_PER_CAM    = 15   # 30fps output / 2fps input = 15 frames per training camera
+CONFIGS           = "arguments/hypernerf/default.py"
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -194,9 +195,18 @@ if __name__ == "__main__":
 
     parser.add_argument("--iteration", default=-1, type=int)
     parser.add_argument("--quiet",     action="store_true")
-
+    parser.add_argument("--samplerate", default=10, type=int)
     args = get_combined_args(parser)
     print("Rendering", args.model_path)
+
+    # Load hardcoded config
+    import importlib.util
+    from utils.params_utils import merge_hparams
+    spec = importlib.util.spec_from_file_location("config", CONFIGS)
+    config_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config_module)
+    config = {k: v for k, v in vars(config_module).items() if not k.startswith("_")}
+    args = merge_hparams(args, config)
 
     safe_state(args.quiet)
 
@@ -211,5 +221,5 @@ if __name__ == "__main__":
         dense_video=True,
         total_frames=None,   # computed dynamically from num cameras * FRAMES_PER_CAM
         video_fps=VIDEO_FPS,
+        samplerate = args.samplerate,
     )
-
