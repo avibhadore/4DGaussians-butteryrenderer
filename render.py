@@ -184,7 +184,6 @@ def render_sets(dataset, hyperparam, iteration, pipeline, skip_train, skip_test,
 # ── Hardcoded rendering settings ─────────────────────────────────────────────
 VIDEO_FPS         = 30
 FRAMES_PER_CAM    = 15   # 30fps output / 2fps input = 15 frames per training camera
-CONFIGS           = "arguments/hypernerf/default.py"
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -198,15 +197,6 @@ if __name__ == "__main__":
     parser.add_argument("--samplerate", default=10, type=int)
     args = get_combined_args(parser)
     print("Rendering", args.model_path)
-
-    # Load hardcoded config
-    import importlib.util
-    from utils.params_utils import merge_hparams
-    spec = importlib.util.spec_from_file_location("config", CONFIGS)
-    config_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(config_module)
-    config = {k: v for k, v in vars(config_module).items() if not k.startswith("_")}
-    args = merge_hparams(args, config)
 
     safe_state(args.quiet)
 
